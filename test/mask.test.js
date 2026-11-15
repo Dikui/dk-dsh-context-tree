@@ -184,16 +184,19 @@ test('the rewind marker row is never rendered', () => {
   assert.equal(marker.getAttribute('data-dk-ct-hidden'), '1')
 })
 
-test('a mask never leaks into a session that reuses turn numbers', () => {
+test('a mask never leaks into a session that reuses turns, keys or ids', () => {
   document.body.children = []
-  const mine = row('a')
+  const mine = row('a', '13:input-messagesame')
   const mask = makeMask()
   mask.maskFromRow(mine)
-  mask.maskRanges({ turns: [7] })
+  mask.maskRanges({ turns: [3], messageIds: ['same'] })
 
-  // Another session renders its own rows with unrelated keys and turns.
+  // The Client clears the singleton when the Chat switches sessions. Without
+  // that boundary the same turn number, flow key or durable id in the next
+  // session would inherit this mask and blank a conversation never rewound.
   document.body.children = []
-  const foreign = row('other-a')
+  mask.clear()
+  const foreign = row('a', '13:input-messagesame')
   foreign.setAttribute('data-chat-turn', '3')
   mask.reapply()
 

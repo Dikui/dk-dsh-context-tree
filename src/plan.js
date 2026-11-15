@@ -84,7 +84,7 @@ export function openTurn(events) {
 export const REWIND_SOURCE_KIND = 'context-tree-rewind'
 
 /**
- * Which turns and messages the live surface no longer contains.
+ * Which turns and messages this plugin's own rewinds no longer expose.
  *
  * The Chat paints one row per appended event and never removes a row, so a
  * `replace` changes what the model reads while the screen keeps the old
@@ -92,8 +92,13 @@ export const REWIND_SOURCE_KIND = 'context-tree-rewind'
  * row from here down", because the user usually types a new message right after
  * a rewind and that message must stay visible.
  *
- * Ranges are folded in log order: every replacement shadows the surface nodes it
- * covers, and the union of those ranges is what the model can no longer see.
+ * Only markers written by this plugin count. DSH also appends `replace` events
+ * for other reasons — a `system/message` is replaced between steps, compaction
+ * emits a `compact-checkpoint` plus replayed `tool/result` events — and those
+ * carry the affected `data.turn` without any user rewind. Folding them would
+ * hide a whole turn the user never cut, in a session that was only compacted or
+ * retried. A marker is a `user/message` whose source kind is
+ * `context-tree-rewind`; the events it covers are then folded in log order.
  *
  * @param {readonly { type: string, seq: number, surfaceOp?: unknown, data?: unknown }[]} events - Complete raw log.
  * @returns {{ cutSeq: number, turns: number[], messageIds: string[] }} Shadowed coverage.
@@ -103,7 +108,8 @@ export function rewindMask(events) {
   if (!Array.isArray(events)) return { cutSeq: -1, turns: [], messageIds: [] }
 
   for (const event of events) {
-    const op = event?.surfaceOp
+    if (event?.type !== 'user/message' || event?.data?.source?.kind !== REWIND_SOURCE_KIND) continue
+    const op = event.surfaceOp
     if (op?.op !== 'replace') continue
     const start = op.startSeq
     const end = op.endSeq

@@ -269,8 +269,21 @@ window.__ModuleLoader__.load({
       return data
     }
 
-    /** Sessions whose mask has already been rebuilt from the log this page load. */
-    const restored = new Set()
+    /**
+     * Session currently represented by the singleton mask.
+     *
+     * The mask is module-level state, but a Chat session is not: turn numbers
+     * restart at 1 for every conversation. Keeping a cut from the previous
+     * session would hide rows with the same turn number in the next one, so the
+     * mask is cleared before a different session is restored.
+     */
+    let activeSessionId = null
+
+    /** Invalidate a restore that was still in flight when the session changed. */
+    let restoreTicket = 0
+
+    /** The restore request currently pending for the active session, if any. */
+    let pendingRestore = null
 
     /**
      * Ask the Host where this session was already cut and hide from there down.
@@ -279,23 +292,50 @@ window.__ModuleLoader__.load({
      * page module. Rebuilding it from the log makes a reload, a bundle reload or
      * a second window show the same transcript the model sees, instead of
      * quietly revealing every shadowed turn again.
+     *
+     * The mask is a singleton but sessions are not, so this also owns the
+     * session boundary: a different `sessionId` clears the mask first and
+     * discards any restore still in flight. A no-rewind session therefore starts
+     * from an empty mask, and switching back re-reads its cut instead of
+     * trusting a mask another session left behind.
+     *
      * @param {string} sessionId - Session shown in the Chat.
+     * @param {{ force?: boolean }} [options] - Re-read even if a restore already
+     *   ran for this session; used after a failed rewind cleared the mask.
      * @returns {Promise<void>} Resolves once the mask was applied or abandoned.
      */
-    async function restoreMask(sessionId) {
-      if (restored.has(sessionId)) return
-      restored.add(sessionId)
-      let outcome
-      try {
-        outcome = await post(CUT_ROUTE, { sessionId })
-      } catch {
+    async function restoreMask(sessionId, options = {}) {
+      const force = options.force === true
+      if (sessionId !== activeSessionId) {
+        activeSessionId = sessionId
+        mask.clear()
+        pendingRestore = null
+      } else if (!force) {
+        if (pendingRestore?.sessionId === sessionId) await pendingRestore.promise
         return
       }
-      if (outcome.ok !== true) return
-      const turns = Array.isArray(outcome.turns) ? outcome.turns : []
-      const messageIds = Array.isArray(outcome.messageIds) ? outcome.messageIds : []
-      if (turns.length === 0 && messageIds.length === 0) return
-      mask.maskRanges({ turns, messageIds })
+
+      const ticket = ++restoreTicket
+      const promise = (async () => {
+        let outcome
+        try {
+          outcome = await post(CUT_ROUTE, { sessionId })
+        } catch {
+          return
+        }
+        if (activeSessionId !== sessionId || ticket !== restoreTicket) return
+        if (outcome.ok !== true) return
+        const turns = Array.isArray(outcome.turns) ? outcome.turns : []
+        const messageIds = Array.isArray(outcome.messageIds) ? outcome.messageIds : []
+        if (turns.length === 0 && messageIds.length === 0) return
+        mask.maskRanges({ turns, messageIds })
+      })()
+      pendingRestore = { sessionId, promise }
+      try {
+        await promise
+      } finally {
+        if (pendingRestore?.promise === promise) pendingRestore = null
+      }
     }
 
     /**
@@ -349,7 +389,7 @@ window.__ModuleLoader__.load({
       const sessionId = props.sessionId
       const inputActions = props.inputActions
 
-      React.useEffect(() => {
+      React.useLayoutEffect(() => {
         const seat = anchor.current
         if (seat === null || typeof sessionId !== 'string') return undefined
         const row = seat.closest('[data-chat-node-key]')
@@ -403,7 +443,11 @@ window.__ModuleLoader__.load({
             settle('done', tr('rewound'))
           } catch (error) {
             if (disposed) return
+            // The optimistic suffix must go: this rewind never happened. Then
+            // rebuild only the cuts the Host still reports for this session,
+            // because clear() also dropped the mask of every earlier rewind.
             mask.clear()
+            void restoreMask(sessionId, { force: true })
             settle('failed', tr(reasonKey(error)))
           }
         }

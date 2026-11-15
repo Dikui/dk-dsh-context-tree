@@ -173,3 +173,87 @@ test('rewindMask is empty for a log without a marker', () => {
 
   assert.deepEqual(rewindMask(events), { cutSeq: -1, turns: [], messageIds: [] })
 })
+
+test('rewindMask ignores a native system replacement', () => {
+  const events = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'system/message', seq: 1, data: { turn: 1 } },
+    { type: 'user/message', seq: 2, data: { id: 'a', source: { kind: 'user' } } },
+    // DSH replaces its per-step system message between steps, inside the same
+    // turn. There is no user rewind here; masking its turn would hide the whole
+    // answer even though this session was never rewound.
+    {
+      type: 'system/message',
+      seq: 3,
+      surfaceOp: { op: 'replace', startSeq: 1, endSeq: 2 },
+      data: { turn: 1 },
+    },
+  ]
+
+  assert.deepEqual(rewindMask(events), { cutSeq: -1, turns: [], messageIds: [] })
+})
+
+test('rewindMask ignores compaction, tool-result and native user replacements', () => {
+  const events = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'user/message', seq: 1, data: { id: 'a', source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 2, data: { turn: 1 } },
+    { type: 'tool/result', seq: 3, data: { turn: 1 } },
+    { type: 'turn/end', seq: 4, data: { turn: 1 } },
+    { type: 'turn/start', seq: 5, data: { turn: 2 } },
+    { type: 'user/message', seq: 6, data: { id: 'b', source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 7, data: { turn: 2 } },
+    { type: 'turn/end', seq: 8, data: { turn: 2 } },
+    // Compaction replaces the whole prefix and re-sends selected tool results.
+    {
+      type: 'user/message',
+      seq: 9,
+      surfaceOp: { op: 'replace', startSeq: 1, endSeq: 8 },
+      data: { id: 'compact', source: { kind: 'compact-checkpoint' } },
+    },
+    {
+      type: 'tool/result',
+      seq: 10,
+      surfaceOp: { op: 'replace', startSeq: 3, endSeq: 3 },
+      data: { turn: 1 },
+    },
+    // Some native messages are replaced without any source kind at all.
+    {
+      type: 'user/message',
+      seq: 11,
+      surfaceOp: { op: 'replace', startSeq: 6, endSeq: 6 },
+      data: { id: 'native-user' },
+    },
+  ]
+
+  assert.deepEqual(rewindMask(events), { cutSeq: -1, turns: [], messageIds: [] })
+})
+
+test('rewindMask folds this plugin marker but not a native replacement', () => {
+  const events = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'user/message', seq: 1, data: { id: 'a', source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 2, data: { turn: 1 } },
+    {
+      type: 'system/message',
+      seq: 3,
+      surfaceOp: { op: 'replace', startSeq: 1, endSeq: 2 },
+      data: { turn: 1 },
+    },
+    { type: 'turn/end', seq: 4, data: { turn: 1 } },
+    { type: 'turn/start', seq: 5, data: { turn: 2 } },
+    { type: 'user/message', seq: 6, data: { id: 'b', source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 7, data: { turn: 2 } },
+    { type: 'turn/end', seq: 8, data: { turn: 2 } },
+    {
+      type: 'user/message',
+      seq: 9,
+      surfaceOp: { op: 'replace', startSeq: 5, endSeq: 8 },
+      data: { id: 'rewind-x', source: { kind: REWIND_SOURCE_KIND } },
+    },
+    { type: 'turn/start', seq: 10, data: { turn: 3 } },
+    { type: 'user/message', seq: 11, data: { id: 'fresh', source: { kind: 'user' } } },
+  ]
+
+  assert.deepEqual(rewindMask(events), { cutSeq: 5, turns: [2], messageIds: ['b'] })
+})

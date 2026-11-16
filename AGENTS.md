@@ -28,6 +28,10 @@
 - Live behaviour is only verified by loading the bundle into a DSH profile: click the icon on a second message, confirm the rows and the right-hand turn rail collapse, confirm the text lands in the composer, then reload the page and confirm the mask survives.
 - A separate throwaway profile (`dsh --profile <name> --port 0 --no-open`) is the safe way to drive a real GUI without touching the user's window.
 
+## Release
+
+- 提交推送前按 [docs/agents/push-rules.md](<docs/agents/push-rules.md>) 默认升修订号；用户明确指定版本或要求不升时除外。
+
 ## Style
 
 - Plain ES modules, no bundler, no new dependencies.

@@ -3,9 +3,9 @@
  *
  * Every user message gets one extra icon next to its copy button. Pressing it
  * previews a rewind to just before that message. Only on confirmation does
- * the Host replace the live surface suffix with one model-invisible marker,
- * so the model stops seeing everything from that message on
- * without any new session being created. The original text then lands back in
+ * the Host replace the live surface suffix with the fixed model-visible notice
+ * “Conversation rewound.” It neither includes the removed text nor starts
+ * a new model request. The original text then lands back in
  * the composer for the user to edit and send again.
  *
  * The Chat paints one row per appended event and never removes a row, so the
@@ -18,8 +18,8 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
-    /** Locale namespace of this plugin. */
-    const NS = 'dk-dsh-context-tree'
+    // Older versions registered under the plugin name without releasing it.
+    const NS = 'dk-dsh-context-tree.client'
     /** Same-origin route that performs the in-place rewind. */
     const TRUNCATE_ROUTE = '/api/dk-dsh-context-tree/truncate'
     /** Same-origin route reporting where an earlier rewind already cut. */
@@ -27,12 +27,14 @@ window.__ModuleLoader__.load({
     /** Same-origin route previewing the file changes a rewind would revert. */
     const PREVIEW_ROUTE = '/api/dk-dsh-context-tree/preview'
 
+    const rewindEn = 'This message and everything after it will be removed. Its text will return to the composer. In their place the model will see only “Conversation rewound.” This does not start a model request.'
+    const rewindZh = '这条消息及之后的对话将被移除，原文会回到输入框。模型会看到替代这段对话的固定说明「Conversation rewound.」，其中不含原文，也不会单独发起模型请求。'
     const messages = {
       en: {
         rewind: 'Rewind to here',
         planning: 'Preparing…',
         'plan-failed': 'Could not prepare the rewind. No changes were made.',
-        'preview-unavailable': 'This Host did not provide a confirmation token. Update the Host plugin before rewinding.',
+        'preview-unavailable': 'This rewind cannot be confirmed with the current plugin versions. Update the Host and client plugins, then reopen the preview.',
         'preview-stale': 'This preview is out of date. Nothing was rewound. Select “Rewind to here” again, review the new preview, and confirm.',
         'flush-failed': 'This conversation may already have been rewound, but saving its history was not confirmed. Your draft was kept. No files were changed. Check the conversation before taking further action.',
         'rewind-unconfirmed': 'The rewind result could not be confirmed. Check the conversation and files before trying again.',
@@ -55,8 +57,8 @@ window.__ModuleLoader__.load({
         'body-too-large': 'The request was too large',
         'method-not-allowed': 'The request was rejected',
         confirmTitle: 'Confirm rewind',
-        confirmBody: 'This message and everything after it leave the model context; its text returns to the composer. Files are left alone unless you opt in. Only eligible changes can be reverted.',
-        confirmBodyNoFiles: 'This message and everything after it leave the model context; its text returns to the composer.',
+        confirmBody: rewindEn + ' Files stay unchanged unless you select the file option.',
+        confirmBodyNoFiles: rewindEn,
         revertFiles: 'Also revert file changes',
         confirmRewind: 'Confirm rewind',
         cancel: 'Cancel',
@@ -87,7 +89,7 @@ window.__ModuleLoader__.load({
         rewind: '回到这里',
         planning: '准备中…',
         'plan-failed': '无法准备回退，没有做任何更改。',
-        'preview-unavailable': '宿主机没有提供预览确认令牌。请先更新宿主机上的插件，再尝试回退。',
+        'preview-unavailable': '当前插件版本无法确认这次回退。请更新宿主端和客户端插件，再重新打开预览。',
         'preview-stale': '预览已过期，本次没有回退。请再次选择「回到这里」，查看最新预览后重新确认。',
         'flush-failed': '当前会话可能已经回退，但历史记录是否保存尚未确认。原草稿保留，文件未改动。请先检查会话状态。',
         'rewind-unconfirmed': '未能确认回退结果。请先检查会话及文件状态，再决定是否重试。',
@@ -110,8 +112,8 @@ window.__ModuleLoader__.load({
         'body-too-large': '请求过大',
         'method-not-allowed': '请求被拒绝',
         confirmTitle: '确认回退',
-        confirmBody: '这条消息及之后的对话将从模型上下文中移除，消息文字会回到输入框。默认不改动文件。勾选后仅尝试还原符合条件的更改。',
-        confirmBodyNoFiles: '这条消息及之后的对话将从模型上下文中移除，消息文字会回到输入框。',
+        confirmBody: rewindZh + '默认不改动文件。勾选后仅尝试还原符合条件的更改。',
+        confirmBodyNoFiles: rewindZh,
         revertFiles: '同时还原文件更改',
         confirmRewind: '确认回退',
         cancel: '取消',
@@ -413,15 +415,15 @@ window.__ModuleLoader__.load({
       const preview = await o.preview(o.target)
       if (!o.isCurrent()) return
       if (preview?.ok !== true) return o.report(preview?.reason || 'plan-failed')
-      const { files, previewToken } = preview
-      if (typeof previewToken !== 'string' || !previewToken.trim()) return o.report('preview-unavailable')
+      const { files, previewToken, markerMode } = preview
+      if (markerMode !== 'notice-v1' || typeof previewToken !== 'string' || !previewToken.trim()) return o.report('preview-unavailable')
       if (!Array.isArray(files) || typeof preview.text !== 'string') return o.report('plan-failed')
       const choice = await o.choose({ text: preview.text, files, revertFiles: false })
       if (!o.isCurrent() || typeof choice !== 'boolean') return
       const revertFiles = choice && files.some(canRevert)
       let outcome
       try {
-        outcome = await o.truncate({ ...o.target, revertFiles, previewToken })
+        outcome = await o.truncate({ ...o.target, revertFiles, previewToken, markerMode })
       } catch {
         if (o.sameSession()) o.report('rewind-unconfirmed')
         return
@@ -918,12 +920,12 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      name: NS,
+      name: 'dk-dsh-context-tree',
       inject: ['locale', 'slots', 'sessions'],
       apply(ctx) {
         const effect = (register, label) => (typeof ctx.effect === 'function' ? ctx.effect(register, label) : register())
 
-        ctx.locale.register(NS, messages)
+        effect(() => ctx.locale.register(NS, messages), 'dk-dsh-context-tree: locale')
         const translate = ctx.locale.bind(NS)
         const tr = key => {
           try {

@@ -2,7 +2,7 @@
  * Host half of dk-dsh-context-tree.
  *
  * Three same-origin routes over Host services:
- * - `truncate` performs an in-place rewind: it appends a model-invisible marker that
+ * - `truncate` performs an in-place rewind: it appends a fixed, model-visible notice that
  *   carries a `surfaceOp: replace` over the live surface suffix, so the model
  *   stops seeing that suffix without any new session being created. When asked,
  *   it then applies only file actions supported by exact evidence.
@@ -33,7 +33,10 @@ export const CUT_ROUTE = '/api/dk-dsh-context-tree/cut'
 /** Same-origin JSON route that previews the file changes a rewind would revert. */
 export const PREVIEW_ROUTE = '/api/dk-dsh-context-tree/preview'
 
-/** Largest request body accepted; every payload here is a pair of scalars. */
+/** Only a Client that disclosed this notice may confirm a rewind. */
+const MARKER_MODE = 'notice-v1'
+
+/** Largest JSON request body accepted by these routes. */
 const MAX_BODY_BYTES = 4096
 
 /** Files above this size are reported but never read into the Host. */
@@ -82,7 +85,8 @@ export function apply(ctx) {
 async function handleRewind(ctx, request, key, confirm) {
   const parsed = await readTarget(request)
   if (parsed.response) return parsed.response
-  const { sessionId, messageId, revertFiles, previewToken } = parsed
+  const { sessionId, messageId, revertFiles, previewToken, markerMode } = parsed
+  if (confirm && markerMode !== MARKER_MODE) return json({ ok: false, reason: 'preview-unavailable' }, 409)
   const stale = () => json({ ok: false, reason: 'preview-stale' }, 409)
   if (confirm && (typeof previewToken !== 'string' || !/^[a-f0-9]{64}:[a-f0-9]{64}$/.test(previewToken))) return stale()
   const session = ctx.sessions.get(sessionId)
@@ -101,7 +105,7 @@ async function handleRewind(ctx, request, key, confirm) {
     marker = planRewind(events, session.surface.nodes, target.seq)
     if (marker.kind === 'error') return confirm ? stale() : json({ ok: false, reason: marker.reason }, 409)
     const sign = value => createHmac('sha256', key).update(JSON.stringify(value)).digest('hex')
-    const revision = sign([sessionId, messageId, target.text, seq, marker.options])
+    const revision = sign([MARKER_MODE, sessionId, messageId, target.text, seq, marker.options])
     if (confirm && previewToken.split(':')[0] !== revision) return stale()
     if (!confirm || revertFiles) {
       files = await planReverts(ctx, session, snapshot, marker.options.sourceEventSeqs)
@@ -116,7 +120,7 @@ async function handleRewind(ctx, request, key, confirm) {
   // No await between the final revision check and append. Includes races with
   // other previews, concurrent confirmations, and turns begun during FS reads.
   if (!isCurrent()) return stale()
-  if (!confirm) return json({ ok: true, text: target.text, files: publicFiles(files), previewToken: token })
+  if (!confirm) return json({ ok: true, markerMode: MARKER_MODE, text: target.text, files: publicFiles(files), previewToken: token })
   let committed
   try {
     committed = session.append(marker.type, marker.data, marker.options)
@@ -408,17 +412,17 @@ async function readSessionTarget(request) {
 /**
  * Validate the shared request envelope and payload.
  * @param {Request} request - Incoming request.
- * @returns {Promise<{ sessionId: string, messageId: string, revertFiles: boolean, previewToken?: string, response?: Response }>} Target or an early response.
+ * @returns {Promise<{ sessionId: string, messageId: string, revertFiles: boolean, previewToken?: string, markerMode?: string, response?: Response }>} Target or an early response.
  */
 async function readTarget(request) {
   const parsed = await readBody(request)
   if (parsed.response !== undefined) return { response: parsed.response }
-  const { sessionId, messageId, revertFiles, previewToken } = parsed.body
+  const { sessionId, messageId, revertFiles, previewToken, markerMode } = parsed.body
   if (typeof sessionId !== 'string' || sessionId.length === 0
     || typeof messageId !== 'string' || messageId.length === 0) {
     return { response: json({ ok: false, reason: 'invalid-request' }, 400) }
   }
-  return { sessionId, messageId, revertFiles: revertFiles === true, previewToken }
+  return { sessionId, messageId, revertFiles: revertFiles === true, previewToken, markerMode }
 }
 
 /**

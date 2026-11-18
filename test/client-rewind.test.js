@@ -12,7 +12,7 @@ const target = { sessionId: 'first', messageId: 'message' }
 const files = [{ path: '/work/note', action: 'restore', status: 'ok' }]
 const mask = { turns: [1], messageIds: ['message'] }
 const previewToken = 'first preview'
-const preview = { ok: true, text: 'hello', files, previewToken }
+const preview = { ok: true, text: 'hello', files, previewToken, markerMode: 'notice-v1' }
 const committed = { ok: true, text: 'hello', mask }
 
 // Replace the Host, confirmation decision, and page-side effects, not Chat or DOM.
@@ -34,7 +34,7 @@ test('confirming the preview leaves even actionable files alone by default', asy
   const s = scenario()
   await s.run()
   assert.deepEqual(s.confirmations, [{ text: preview.text, files, revertFiles: false }])
-  assert.deepEqual(s.requests, [{ ...target, revertFiles: false, previewToken }])
+  assert.deepEqual(s.requests, [{ ...target, revertFiles: false, previewToken, markerMode: 'notice-v1' }])
   assert.deepEqual(s.masks, [mask])
   assert.deepEqual(s.drafts, ['hello'])
 })
@@ -46,6 +46,16 @@ for (const filePlans of [[], [{ ...files[0], action: 'already-absent' }], [{ ...
     assert.equal(s.requests[0].revertFiles, false)
   })
 }
+
+// small/spec — consent to the fixed model-visible notice must match the Host protocol.
+test('an absent or unknown notice mode cannot offer a rewind for confirmation', async () => {
+  for (const markerMode of [undefined, 'notice-v2']) {
+    const s = scenario({ preview: async () => ({ ...preview, markerMode }) })
+    await s.run()
+    assert.deepEqual([s.confirmations, s.requests], [[], []])
+    assert.equal(s.notices[0].key, 'preview-unavailable')
+  }
+})
 
 test('a tokenless Host cannot offer a rewind for confirmation', async () => {
   const { previewToken: _, ...withoutToken } = preview
@@ -83,7 +93,7 @@ test('only explicit file opt-in sends true, with skipped paths reported after th
     truncate: async body => { s.requests.push(body); return { ...committed, files: [skipped] } },
   })
   await s.run()
-  assert.deepEqual(s.requests, [{ ...target, revertFiles: true, previewToken }])
+  assert.deepEqual(s.requests, [{ ...target, revertFiles: true, previewToken, markerMode: 'notice-v1' }])
   assert.deepEqual(s.masks, [mask])
   assert.deepEqual(s.notices, [{ key: 'files-skipped', details: [skipped] }])
 })
@@ -190,6 +200,63 @@ test('a draft error after a successful cut does not misreport rewind failure', a
   await s.run()
   assert.deepEqual(s.masks, [mask])
   assert.equal(s.notices[0].key, 'draft-failed')
+})
+
+// Exercise the shipped module-loader entry. The registry models DSH's duplicate
+// rejection and scoped unregister; the DOM stub represents preinstalled styles.
+function clientLoader(previous = new Map()) {
+  const registry = previous
+  const locale = {
+    register(ns, messages) {
+      if (registry.has(ns)) throw new Error(`locale namespace ${ns} already registered`)
+      registry.set(ns, messages)
+      return () => registry.delete(ns)
+    },
+    bind: ns => key => registry.get(ns)?.zh[key] ?? key,
+  }
+  return () => {
+    const disposers = []
+    let slot, plugin
+    const slots = { inject: (_, register) => register(), register: (entry, render) => {
+      slot = { ...entry, render }; return () => { slot = null }
+    } }
+    const window = { __ModuleLoader__: { load: entry => { plugin = entry.factory(() => ({ createElement: (_, props) => props })) } } }
+    const document = { getElementById: () => ({}), querySelectorAll: () => [] }
+    new Function('window', 'document', source)(window, document)
+    plugin.apply({ locale, slots, effect: register => disposers.push(register()) })
+    return { name: plugin.name, slot, dispose: () => disposers.reverse().forEach(fn => fn()) }
+  }
+}
+
+// small/regression — a prior unscoped version can leave its namespace occupied.
+test('hot-loading over a legacy dictionary allows repeated activation and disposal', () => {
+  const legacy = 'dk-dsh-context-tree', ns = 'dk-dsh-context-tree.client'
+  const registry = new Map([[legacy, { zh: { rewind: '旧版' } }]])
+  const activate = clientLoader(registry)
+  for (let i = 0; i < 2; i++) {
+    const client = activate()
+    assert.equal(client.name, legacy)
+    assert.equal(client.slot.locale, ns)
+    assert.equal(client.slot.render({}).tr('rewind'), '回到这里')
+    client.dispose()
+    assert.deepEqual([...registry.keys()], [legacy])
+  }
+})
+
+// small/spec — both supported locales disclose the exact model-visible notice
+// before consent, whether the preview has file changes or not.
+test('confirmation copy discloses the fixed notice without promising a new model request', () => {
+  const registry = new Map()
+  const client = clientLoader(registry)()
+  const { en, zh } = registry.get(client.slot.locale)
+  for (const key of ['confirmBody', 'confirmBodyNoFiles']) {
+    for (const text of [en[key], zh[key]]) assert.ok(text.includes('Conversation rewound.'))
+    assert.match(en[key], /model will see/i)
+    assert.match(en[key], /does not start a model request/i)
+    assert.match(zh[key], /模型会看到/)
+    assert.match(zh[key], /不会单独发起模型请求/)
+  }
+  client.dispose()
 })
 
 // small/regression — backend-specific error codes need a readable localized label.

@@ -78,7 +78,7 @@ export function harness({ files = new Map(), policy = { mode: 'workspace-write',
   }
   return { ctx, session, routes, events, mutations, files, turn, fileResult,
     preview: messageId => request(PREVIEW_ROUTE, { sessionId: 's', messageId }),
-    confirm: (messageId, previewToken, revertFiles = false) => request(TRUNCATE_ROUTE, { sessionId: 's', messageId, previewToken, revertFiles }),
+    confirm: (messageId, previewToken, revertFiles = false) => request(TRUNCATE_ROUTE, { sessionId: 's', messageId, previewToken, revertFiles, markerMode: 'notice-v1' }),
     cut: () => request(CUT_ROUTE, { sessionId: 's' }),
   }
 }

@@ -80,17 +80,16 @@ export function openTurn(events) {
   return open
 }
 
-/** Producer identity shared by legacy user markers and empty developer markers. */
+/** Stable producer identity for all generations of this plugin's rewind markers. */
 export const REWIND_SOURCE_KIND = 'context-tree-rewind'
 const CHAT_TYPES = new Set(['user/message', 'assistant/message', 'tool/result'])
 const SURFACE_TYPES = new Set([...CHAT_TYPES, 'system/message', 'developer/message'])
 
 /**
- * Plan one positional replacement; no model message should stand in for the
- * selected user input. DSH projects a developer message with zero blocks to
- * null. Unlike a system or assistant event it neither owns the system prompt
- * nor claims a model-generated stream. Attribute this plugin's context change
- * to the actual step at the boundary, never an invented model position.
+ * Replace the selected surface suffix with a fixed notice, not the draft.
+ * V4 permits a producer-attributed user replacement between turns; a developer
+ * event there fails cold restore even if it cites an earlier real step.
+ * This is a log operation, not inbox delivery: it does not start a new turn.
  * @param {readonly object[]} events - Raw V4 log used to resolve the target.
  * @param {readonly number[]} nodes - Current surface in model-visible order.
  * @param {number} startSeq - Sequence of the selected append-origin prompt.
@@ -123,11 +122,10 @@ export function planRewind(events, nodes, startSeq) {
   const sourceEventSeqs = nodes.slice(index)
   return {
     kind: 'ok',
-    type: 'developer/message',
+    type: 'user/message',
     data: {
-      turn: position.turn,
-      step: position.step,
-      message: { id: `rewind-${startSeq}`, role: 'developer', content: [], source: { kind: REWIND_SOURCE_KIND } },
+      id: `rewind-${startSeq}`, role: 'user', source: { kind: REWIND_SOURCE_KIND },
+      content: [{ type: 'text', text: 'Conversation rewound.' }],
     },
     options: { surfaceOp: { op: 'replace', startSeq, endSeq: sourceEventSeqs.at(-1) }, sourceEventSeqs },
   }
@@ -170,10 +168,10 @@ export function rewindMask(events) {
     const removed = nodes.splice(start, end - start + 1, event.seq)
     children.set(event.seq, removed)
     const message = event.type === 'user/message' ? event.data : event.data?.message
-    const legacy = event.type === 'user/message' && message?.role === 'user'
-    const current = event.type === 'developer/message' && message?.role === 'developer'
+    const userMarker = event.type === 'user/message' && message?.role === 'user'
+    const legacyDeveloper = event.type === 'developer/message' && message?.role === 'developer'
       && Array.isArray(message.content) && message.content.length === 0
-    if ((legacy || current) && message.source?.kind === REWIND_SOURCE_KIND) {
+    if ((userMarker || legacyDeveloper) && message.source?.kind === REWIND_SOURCE_KIND) {
       const sources = event.sourceEventSeqs
       // DSH permits extra citations. A legacy numeric-range producer could
       // legally cite a replaced system head that actually survived this cut.

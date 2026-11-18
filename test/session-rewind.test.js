@@ -18,12 +18,11 @@ try {
 }
 const sessionTest = (name, fn) => test(name, { skip: installed ? false : 'installed DSH runtime unavailable' }, fn)
 
-function fixture() {
-  const { Session } = require(installed)
-  const session = Session.create('rewind-in-memory')
-  let turn = 0
+function fixture(session = require(installed).Session.create('rewind-in-memory')) {
   function input(text) {
-    const pos = { turn: ++turn, step: 1 }
+    const lastTurn = session.snapshotEvents().findLast(e => e.type === 'turn/start')
+    const turn = (lastTurn?.data.turn ?? 0) + 1
+    const pos = { turn, step: 1 }
     session.append('turn/start', { turn })
     session.append('step/start', pos)
     if (turn === 1) session.append('system/message', {
@@ -47,24 +46,30 @@ function fixture() {
   return { session, input, rewind, text: () => session.deriveMessages().map(m => m.content.map(b => b.text).join('')) }
 }
 
-sessionTest('rewind removes the target itself, retaining exactly its conversation prefix across subsequent rewinds', () => {
+const NOTICE = 'Conversation rewound.'
+function expectedNotice(event) {
+  return { id: `rewind-${event.seq}`, role: 'user', source: { kind: 'context-tree-rewind' }, content: [{ type: 'text', text: NOTICE }] }
+}
+
+sessionTest('rewind removes the target itself, retaining only its conversation prefix and a fixed notice across subsequent rewinds', () => {
   const { session, input, rewind, text } = fixture()
   input('A')
   const b = input('B')
   rewind(b.seq)
-  assert.deepEqual(text(), ['SYSTEM', 'A', 'A-reply'])
+  assert.deepEqual(text(), ['SYSTEM', 'A', 'A-reply', NOTICE])
   input('C')
-  rewind(input('D').seq)
-  assert.deepEqual(text(), ['SYSTEM', 'A', 'A-reply', 'C', 'C-reply'])
-  assert.deepEqual(plan.rewindMask(session.snapshotEvents()), { cutSeq: b.seq, turns: [2, 4], messageIds: ['u2', 'u4'] })
+  const d = input('D')
+  rewind(d.seq)
+  assert.deepEqual(text(), ['SYSTEM', 'A', 'A-reply', NOTICE, 'C', 'C-reply', NOTICE])
+  assert.deepEqual(plan.rewindMask(session.snapshotEvents()), { cutSeq: b.seq, turns: [2, 4], messageIds: ['u2', `rewind-${b.seq}`, 'u4', `rewind-${d.seq}`] })
 })
 
-sessionTest('the preview, confirm and reload routes agree with the installed model projection', async () => {
+sessionTest('the preview, confirm and cut routes agree with the in-memory model projection', async () => {
   const { session, input, text } = fixture(), host = harness()
   host.ctx.sessions.get = id => id === 's' ? session : undefined
   host.ctx.sessionQuery.readSession = async () => ({ events: session.snapshotEvents(), inheritedEventCount: 0 })
   input('A')
-  for (const [prompt, retained] of [['B', ['SYSTEM', 'A', 'A-reply']], ['D', ['SYSTEM', 'A', 'A-reply', 'C', 'C-reply']]]) {
+  for (const [prompt, retained] of [['B', ['SYSTEM', 'A', 'A-reply', NOTICE]], ['D', ['SYSTEM', 'A', 'A-reply', NOTICE, 'C', 'C-reply', NOTICE]]]) {
     if (prompt === 'D') input('C')
     const { data: { id } } = input(prompt)
     const preview = await host.preview(id)
@@ -74,6 +79,101 @@ sessionTest('the preview, confirm and reload routes agree with the installed mod
     assert.deepEqual(text(), retained)
     assert.deepEqual(await host.cut(), { ok: true, ...response.mask })
   }
+})
+
+// Regression: 0.0.4 reported a successful rewind, but reopening its V4 log
+// failed with “developer/message does not match an open turn and step”. Each
+// visit starts a fresh store AND JSONL provider, so neither can serve a cached
+// prefix. Use the shipped zstd writer, fsync barrier, and cold V4 decoder.
+async function visitDiskSession(root, create, use) {
+  const runtime = createRequire(installed)
+  const { Context } = runtime('@deepseek-ai/cordis')
+  const { Session, SessionStore } = require(installed)
+  const ctx = new Context()
+  const store = ctx.plugin(SessionStore)
+  const backend = ctx.plugin(runtime('@deepseek-ai/dsh-session-persistence-jsonl'), { root })
+  try {
+    await Promise.all([store.await(), backend.await()])
+    const id = 's'
+    const initial = create && Session.create(id, [], { version: 4, id, createdAt: 1, isSeeded: false, delegationDepth: 0 })
+    const handle = initial ? await ctx.sessionPersistence.create(initial.header) : await ctx.sessionPersistence.open(id, 'write')
+    try {
+      // Like DSH, seed the writer before publishing the instance. Constructor
+      // events aren't re-emitted to session/event listeners on store entry.
+      const { events, eventState } = await handle.read()
+      const session = initial || Session.fromRestore(id, events, handle.header, handle.inheritedEventCount, eventState)
+      await handle.append(session.snapshotEvents(events.length)) // includes any new end-seed boundary on resume
+      const detach = ctx.sessions.enter(session)
+      try {
+        ctx.sessions.announce(session)
+        const host = harness()
+        host.ctx.sessions = ctx.sessions // confirm uses the actual session/flush listener
+        host.ctx.sessionQuery.readSession = async () => ({ events: session.snapshotEvents(), inheritedEventCount: session.inheritedEventCount })
+        return await use({ ...fixture(session), host, flush: () => ctx.sessions.flush(session) })
+      } finally { detach() }
+    } finally { await handle.close() }
+  } finally {
+    await backend.dispose()
+    await store.dispose()
+  }
+}
+
+sessionTest('a confirmed rewind survives a cold V4 reopen and preserves the exact prefix for subsequent input and rewind', async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'dsh-rewind-v4-')))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const start = await visitDiskSession(root, true, async ({ session, input, flush }) => {
+    input('A')
+    const prefix = session.deriveMessages()
+    const b = input('B')
+    assert.equal(await flush(), true)
+    return { prefix, b, all: session.deriveMessages() }
+  })
+  async function confirm(session, host, event, prompt) {
+    const before = session.seq
+    const preview = await host.preview(event.data.id)
+    assert.equal(preview.ok, true, preview.reason); assert.equal(preview.text, prompt)
+    const result = await host.confirm(event.data.id, preview.previewToken)
+    assert.equal(result.ok, true, result.reason); assert.equal(result.text, prompt)
+    return { before, after: session.seq, mask: result.mask }
+  }
+  function verifyStoredNotice(session, { before, after }, target) {
+    // Check the complete newly persisted range. In particular, no turn/start,
+    // step/start or agent/inbox/spliced for next-turn/next-step was emitted.
+    const delta = session.snapshotEvents().slice(before, after)
+    assert.deepEqual(delta.map(e => e.type), ['user/message'])
+    assert.equal(delta[0].surfaceOp.op, 'replace')
+    assert.deepEqual(delta[0].data, expectedNotice(target)) // no turn or step attribution
+  }
+  const first = await visitDiskSession(root, false, async ({ session, host }) => {
+    // Positive control: this exact synthetic on-disk artifact opens before
+    // the plugin changes it. A malformed fixture must not count as this bug.
+    assert.deepEqual(session.deriveMessages(), start.all)
+    assert.deepEqual(await host.cut(), { ok: true, cutSeq: -1, turns: [], messageIds: [] })
+    return confirm(session, host, start.b, 'B')
+  })
+  const next = await visitDiskSession(root, false, async ({ session, host, input }) => {
+    verifyStoredNotice(session, first, start.b)
+    const retained = [...start.prefix, expectedNotice(start.b)]
+    assert.deepEqual(session.deriveMessages(), retained)
+    assert.deepEqual(first.mask, { cutSeq: start.b.seq, turns: [2], messageIds: ['u2', `rewind-${start.b.seq}`] })
+    assert.deepEqual(await host.cut(), { ok: true, ...first.mask })
+    input('C')
+    const prefix = session.deriveMessages()
+    assert.deepEqual(prefix.slice(0, -2), retained)
+    assert.deepEqual(prefix.slice(-2).map(m => [m.role, m.content]), [
+      ['user', [{ type: 'text', text: 'C' }]], ['assistant', [{ type: 'text', text: 'C-reply' }]],
+    ])
+    const d = input('D')
+    return { prefix, d, ...await confirm(session, host, d, 'D') }
+  })
+  await visitDiskSession(root, false, async ({ session, host }) => {
+    verifyStoredNotice(session, next, next.d)
+    assert.deepEqual(session.deriveMessages(), [...next.prefix, expectedNotice(next.d)])
+    assert.deepEqual(next.mask, {
+      cutSeq: start.b.seq, turns: [2, 4], messageIds: ['u2', `rewind-${start.b.seq}`, 'u4', `rewind-${next.d.seq}`],
+    })
+    assert.deepEqual(await host.cut(), { ok: true, ...next.mask })
+  })
 })
 
 async function localFileFixture(t) {
@@ -157,11 +257,12 @@ sessionTest('an existing legacy marker is masked by id without consuming a later
     surfaceOp: { op: 'replace', startSeq: b.seq, endSeq: b.seq + 1 }, sourceEventSeqs: [b.seq, b.seq + 1],
   })
   input('C')
-  rewind(input('D').seq)
+  const d = input('D')
+  rewind(d.seq)
   // A legacy marker was already model-visible. Do not silently rewrite history
   // before the requested cut in an attempt to migrate that historical row.
-  assert.deepEqual(text(), ['SYSTEM', 'A', 'A-reply', 'B', 'C', 'C-reply'])
-  assert.deepEqual(plan.rewindMask(session.snapshotEvents()), { cutSeq: b.seq, turns: [2, 4], messageIds: ['u2', 'rewind-legacy', 'u4'] })
+  assert.deepEqual(text(), ['SYSTEM', 'A', 'A-reply', 'B', 'C', 'C-reply', NOTICE])
+  assert.deepEqual(plan.rewindMask(session.snapshotEvents()), { cutSeq: b.seq, turns: [2, 4], messageIds: ['u2', 'rewind-legacy', 'u4', `rewind-${d.seq}`] })
 })
 
 sessionTest('legacy numeric provenance may cite a retained head without masking its turn', () => {
@@ -199,6 +300,6 @@ sessionTest('nonmonotonic replacements keep the newer system head and mask the r
   }, { surfaceOp: { op: 'replace', startSeq: c.seq, endSeq: c.seq }, sourceEventSeqs: [a.seq, c.seq] })
   const marker = rewind(b.seq)
   assert.deepEqual(marker.sourceEventSeqs, [b.seq, b.seq + 1, marker.seq - 1, c.seq + 1])
-  assert.deepEqual(text(), ['SYSTEM', 'A', 'A-reply'])
-  assert.deepEqual(plan.rewindMask(session.snapshotEvents()), { cutSeq: b.seq, turns: [2, 3], messageIds: ['u2', 'u3'] })
+  assert.deepEqual(text(), ['SYSTEM', 'A', 'A-reply', NOTICE])
+  assert.deepEqual(plan.rewindMask(session.snapshotEvents()), { cutSeq: b.seq, turns: [2, 3], messageIds: ['u2', 'u3', `rewind-${b.seq}`] })
 })

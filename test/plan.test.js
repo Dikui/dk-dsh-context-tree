@@ -143,6 +143,21 @@ test('an open turn is reported and a closed one is not', () => {
 const twoTurns = () => [...turn(1, 'first', 'a'), ...turn(2, 'second', 'b')]
 const legacyCut = () => ['user/message', user('rewind-x', 'second', REWIND_SOURCE_KIND), replace(8, 9, 8, 9)]
 
+test('an idle rewind produces one attributed user notice, not an event in a closed step', () => {
+  const plan = planRewind(log(twoTurns()), [2, 3, 8, 9], 8)
+  assert.deepEqual(plan, {
+    kind: 'ok', type: 'user/message', data: user('rewind-8', 'Conversation rewound.', REWIND_SOURCE_KIND),
+    options: replace(8, 9, 8, 9),
+  })
+})
+
+test('rewindMask still recognizes historical empty developer markers in readable logs', () => {
+  const marker = ['developer/message', { turn: 2, step: 1, message: {
+    id: 'rewind-8', role: 'developer', content: [], source: { kind: REWIND_SOURCE_KIND },
+  } }, replace(8, 9, 8, 9)]
+  assert.deepEqual(rewindMask(log([...twoTurns(), marker])), { cutSeq: 8, turns: [2], messageIds: ['b'] })
+})
+
 test('rewindMask reports the turns and messages a marker shadowed', () => {
   const mask = rewindMask(log([...twoTurns(), legacyCut()]))
   assert.equal(mask.cutSeq, 8)

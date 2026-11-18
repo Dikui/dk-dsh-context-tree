@@ -54,6 +54,8 @@ class Node {
     return child
   }
 
+  get parentElement() { return this.parent }
+
   get isConnected() {
     let node = this
     while (node.parent !== null) node = node.parent
@@ -129,14 +131,14 @@ function makeMask() {
   return loadMaskFactory()({ document, MutationObserver })
 }
 
-test('a rewind hides the clicked row and everything below it', () => {
+test('only the rows the Host identified as shadowed are hidden', () => {
   document.body.children = []
   const first = row('a')
   const second = row('b')
   const third = row('c')
   const mask = makeMask()
 
-  assert.equal(mask.maskFromRow(second), 2)
+  mask.maskRanges({ messageIds: ['b', 'c'] })
   assert.equal(first.getAttribute('data-dk-ct-hidden'), null)
   assert.equal(second.getAttribute('data-dk-ct-hidden'), '1')
   assert.equal(third.getAttribute('data-dk-ct-hidden'), '1')
@@ -144,12 +146,27 @@ test('a rewind hides the clicked row and everything below it', () => {
   assert.equal(first.style.display, '')
 })
 
+test('a masked turn keeps only its retained context cards, including inside a group', () => {
+  document.body.children = []
+  const mask = makeMask()
+  const group = document.body.append(new Node('div', { 'data-chat-flow-key': 'g', 'data-chat-turn': '1' }))
+  const card = group.append(new Node('div', { 'data-chat-flow-key': 'sys', 'data-chat-node-key': '14:system-message2', 'data-chat-turn': '1' }))
+  const reply = group.append(new Node('div', { 'data-chat-flow-key': 'reply', 'data-chat-node-key': '9:assistant3', 'data-chat-turn': '1' }))
+  mask.maskRanges({ turns: [1], retainedRowKeys: ['14:system-message2'] })
+  assert.equal(group.style.display, '')
+  assert.equal(card.style.display, '')
+  assert.equal(reply.style.display, 'none')
+  mask.maskRanges({ turns: [1] }) // a deeper cut no longer retains the card
+  assert.equal(group.style.display, 'none')
+  assert.equal(card.style.display, 'none')
+})
+
 test('a masked row stays hidden after React rebuilds the transcript', () => {
   document.body.children = []
-  const first = row('a')
-  const second = row('b')
+  row('a')
+  row('b')
   const mask = makeMask()
-  mask.maskFromRow(second)
+  mask.maskRanges({ messageIds: ['b'] })
 
   rerender([{ key: 'a' }, { key: 'b' }, { key: 'c' }])
 
@@ -162,9 +179,9 @@ test('a masked row stays hidden after React rebuilds the transcript', () => {
 test('clearing the mask brings every hidden row back', () => {
   document.body.children = []
   row('a')
-  const second = row('b')
+  row('b')
   const mask = makeMask()
-  mask.maskFromRow(second)
+  mask.maskRanges({ messageIds: ['b'] })
   mask.clear()
 
   for (const element of document.querySelectorAll('[data-chat-flow-key]')) {
@@ -174,21 +191,22 @@ test('clearing the mask brings every hidden row back', () => {
   assert.equal(observers.length, 0, 'the observer is released')
 })
 
-test('the rewind marker row is never rendered', () => {
+test('only the exact legacy marker id from the Host is hidden', () => {
   document.body.children = []
-  const marker = row('m', '13:input-messagerewind-mwgyx1go')
+  const marker = row('m', '13:input-messagerewind-recorded')
+  const ordinary = row('u', '13:input-messageuser-rewind-note')
   const mask = makeMask()
 
-  mask.reapply()
+  mask.maskRanges({ messageIds: ['rewind-recorded'] })
 
   assert.equal(marker.getAttribute('data-dk-ct-hidden'), '1')
+  assert.equal(ordinary.getAttribute('data-dk-ct-hidden'), null)
 })
 
 test('a mask never leaks into a session that reuses turns, keys or ids', () => {
   document.body.children = []
-  const mine = row('a', '13:input-messagesame')
+  row('a', '13:input-messagesame')
   const mask = makeMask()
-  mask.maskFromRow(mine)
   mask.maskRanges({ turns: [3], messageIds: ['same'] })
 
   // The Client clears the singleton when the Chat switches sessions. Without

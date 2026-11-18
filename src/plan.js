@@ -1,9 +1,9 @@
 /**
  * Pure history analysis behind the per-message "rewind to here" action.
  *
- * Everything here works on raw `SessionEvent[]` as returned by
- * `ctx.sessionQuery.readSession(id)`, so it stays independent of the Session
- * Store, of projection state, and of the Client.
+ * Inputs are the raw `SessionEvent[]` from `ctx.sessionQuery.readSession(id)`
+ * and, for planRewind, the live ordered surface node ids. No store or Client
+ * services are needed here.
  *
  * @module dk-dsh-context-tree/plan
  */
@@ -80,8 +80,58 @@ export function openTurn(events) {
   return open
 }
 
-/** Source kind stamped on the message this plugin appends to carry a rewind. */
+/** Producer identity shared by legacy user markers and empty developer markers. */
 export const REWIND_SOURCE_KIND = 'context-tree-rewind'
+const CHAT_TYPES = new Set(['user/message', 'assistant/message', 'tool/result'])
+const SURFACE_TYPES = new Set([...CHAT_TYPES, 'system/message', 'developer/message'])
+
+/**
+ * Plan one positional replacement; no model message should stand in for the
+ * selected user input. DSH projects a developer message with zero blocks to
+ * null. Unlike a system or assistant event it neither owns the system prompt
+ * nor claims a model-generated stream. Attribute this plugin's context change
+ * to the actual step at the boundary, never an invented model position.
+ * @param {readonly object[]} events - Raw V4 log used to resolve the target.
+ * @param {readonly number[]} nodes - Current surface in model-visible order.
+ * @param {number} startSeq - Sequence of the selected append-origin prompt.
+ */
+export function planRewind(events, nodes, startSeq) {
+  const index = nodes.indexOf(startSeq)
+  if (index < 0) return { kind: 'error', reason: 'not-surface-node' }
+  let turn, position, target
+  let hasEarlierRow = false
+  for (const event of events) {
+    if (event.seq === startSeq) { target = event; break }
+    if (event.type === 'turn/start') {
+      turn = event.data?.turn
+      position = undefined
+      hasEarlierRow = false
+    } else if (event.type === 'turn/end') {
+      turn = position = undefined
+    } else if (event.type === 'step/start') position = event.data
+    else if (event.type === 'step/end') position = undefined
+    if (isAppend(event) && CHAT_TYPES.has(event.type)) hasEarlierRow = true
+  }
+  if (target?.type !== 'user/message' || !isAppend(target)) return { kind: 'error', reason: 'unknown-message' }
+  if (!Number.isSafeInteger(turn) || turn < 1 || position?.turn !== turn
+    || !Number.isSafeInteger(position.step) || position.step < 1) {
+    return { kind: 'error', reason: 'missing-step-position' }
+  }
+  // Chat's existing mask can hide complete turns, not the trailing steps of
+  // one turn. Fail closed instead of hiding a prefix the model will still see.
+  if (hasEarlierRow) return { kind: 'error', reason: 'partial-turn' }
+  const sourceEventSeqs = nodes.slice(index)
+  return {
+    kind: 'ok',
+    type: 'developer/message',
+    data: {
+      turn: position.turn,
+      step: position.step,
+      message: { id: `rewind-${startSeq}`, role: 'developer', content: [], source: { kind: REWIND_SOURCE_KIND } },
+    },
+    options: { surfaceOp: { op: 'replace', startSeq, endSeq: sourceEventSeqs.at(-1) }, sourceEventSeqs },
+  }
+}
 
 /**
  * Which turns and messages this plugin's own rewinds no longer expose.
@@ -95,66 +145,86 @@ export const REWIND_SOURCE_KIND = 'context-tree-rewind'
  * Only markers written by this plugin count. DSH also appends `replace` events
  * for other reasons — a `system/message` is replaced between steps, compaction
  * emits a `compact-checkpoint` plus replayed `tool/result` events — and those
- * carry the affected `data.turn` without any user rewind. Folding them would
- * hide a whole turn the user never cut, in a session that was only compacted or
- * retried. A marker is a `user/message` whose source kind is
- * `context-tree-rewind`; the events it covers are then folded in log order.
+ * carry extra provenance that need not lie in the replaced range. Replay
+ * positional splices to recover the exact nodes each replacement covered.
+ * Start the ancestry walk only at our markers; native replacements then lead
+ * to original Chat rows only when a rewind eventually shadows those nodes.
  *
  * @param {readonly { type: string, seq: number, surfaceOp?: unknown, data?: unknown }[]} events - Complete raw log.
- * @returns {{ cutSeq: number, turns: number[], messageIds: string[] }} Shadowed coverage.
+ * @returns {{ cutSeq: number, turns: number[], messageIds: string[], retainedRowKeys?: string[] }} Shadowed coverage and any context cards retained within those turns.
  */
 export function rewindMask(events) {
-  const shadowed = new Set()
+  const nodes = []
+  const children = new Map()
+  const markers = new Set()
+  const work = []
   if (!Array.isArray(events)) return { cutSeq: -1, turns: [], messageIds: [] }
-
   for (const event of events) {
-    if (event?.type !== 'user/message' || event?.data?.source?.kind !== REWIND_SOURCE_KIND) continue
+    if (!SURFACE_TYPES.has(event?.type)) continue
+    if (isAppend(event)) { nodes.push(event.seq); continue }
     const op = event.surfaceOp
     if (op?.op !== 'replace') continue
-    const start = op.startSeq
-    const end = op.endSeq
-    if (typeof start !== 'number' || typeof end !== 'number' || end < start) continue
-    for (let seq = start; seq <= end; seq += 1) shadowed.add(seq)
+    const start = nodes.indexOf(op.startSeq)
+    const end = nodes.indexOf(op.endSeq)
+    if (start < 0 || end < start) continue
+    const removed = nodes.splice(start, end - start + 1, event.seq)
+    children.set(event.seq, removed)
+    const message = event.type === 'user/message' ? event.data : event.data?.message
+    const legacy = event.type === 'user/message' && message?.role === 'user'
+    const current = event.type === 'developer/message' && message?.role === 'developer'
+      && Array.isArray(message.content) && message.content.length === 0
+    if ((legacy || current) && message.source?.kind === REWIND_SOURCE_KIND) {
+      const sources = event.sourceEventSeqs
+      // DSH permits extra citations. A legacy numeric-range producer could
+      // legally cite a replaced system head that actually survived this cut.
+      if (!Array.isArray(sources)) continue
+      const ids = new Set(sources)
+      if (ids.size !== sources.length || !removed.every(seq => ids.has(seq))) continue
+      markers.add(event.seq)
+      for (const seq of removed) work.push(seq)
+    }
   }
-  if (shadowed.size === 0) return { cutSeq: -1, turns: [], messageIds: [] }
 
-  const turns = new Set()
-  const messageIds = new Set()
-  let cutSeq = -1
-  for (const event of events) {
-    if (typeof event?.seq !== 'number' || !shadowed.has(event.seq)) continue
-    if (cutSeq < 0 || event.seq < cutSeq) cutSeq = event.seq
-    const turn = event.data?.turn
-    if (typeof turn === 'number') turns.add(turn)
-    if (event.type === 'user/message' && typeof event.data?.id === 'string') messageIds.add(event.data.id)
+  const hidden = new Set()
+  while (work.length) {
+    const seq = work.pop()
+    if (hidden.has(seq)) continue
+    hidden.add(seq)
+    for (const child of children.get(seq) || []) work.push(child)
   }
+  const turns = new Set()
+  const retainedTurns = new Set()
+  const messageIds = new Set()
+  const contextCards = []
+  let cutSeq = -1
+  let open
+  for (const event of events) {
+    if (event.type === 'turn/start') open = event.data?.turn
+    if (event.type === 'turn/end') open = undefined
+    if (markers.has(event.seq) && event.type === 'user/message') messageIds.add(event.data.id)
+    if (!isAppend(event)) continue
+    const turn = event.data?.turn ?? open
+    // Chat keys system cards by seq and developer cards by durable message id.
+    // A whole-turn mask still needs to leave the retained context prefix visible.
+    if (!hidden.has(event.seq)) {
+      if (event.type === 'system/message') contextCards.push([turn, `14:system-message${event.seq}`])
+      if (event.type === 'developer/message' && typeof event.data?.message?.id === 'string') {
+        contextCards.push([turn, `17:developer-message${event.data.message.id}`])
+      }
+    }
+    if (!CHAT_TYPES.has(event.type)) continue
+    if (hidden.has(event.seq)) {
+      if (cutSeq < 0) cutSeq = event.seq
+      if (Number.isSafeInteger(turn)) turns.add(turn)
+      if (event.type === 'user/message' && typeof event.data?.id === 'string') messageIds.add(event.data.id)
+    } else if (Number.isSafeInteger(turn)) retainedTurns.add(turn)
+  }
+  for (const turn of retainedTurns) turns.delete(turn)
+  const retainedRowKeys = contextCards.filter(([turn]) => turns.has(turn)).map(([, key]) => key)
   return {
     cutSeq,
     turns: [...turns].sort((a, b) => a - b),
     messageIds: [...messageIds],
-  }
-}
-
-/**
- * Build the `user/message` payload that shadows a surface suffix.
- *
- * The payload must carry a `source`. DSH derives pending input from durable
- * `user/message` events and reads `source.kind` on every candidate, so a message
- * without one makes the *next* prompt fail with
- * `Cannot read properties of undefined (reading 'kind')` — a failure that only
- * shows up after the rewind, far from its cause. The custom kind also keeps this
- * event out of the "pending user input" set, which a `user` source would join,
- * so the Host never answers the rewind message on its own.
- *
- * @param {string} text - Text of the message the user is rewinding to.
- * @param {number} [now] - Millisecond timestamp used for the durable id.
- * @returns {{ id: string, role: 'user', content: { type: 'text', text: string }[], source: { kind: string } }} Message payload.
- */
-export function buildRewindMessage(text, now = Date.now()) {
-  return {
-    id: `rewind-${now.toString(36)}`,
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: REWIND_SOURCE_KIND },
+    ...(retainedRowKeys.length ? { retainedRowKeys } : {}),
   }
 }

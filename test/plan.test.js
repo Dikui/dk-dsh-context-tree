@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { buildRewindMessage, extractUserText, openTurn, rewindMask, rewindTarget, REWIND_SOURCE_KIND } from '../src/plan.js'
+import { extractUserText, openTurn, planRewind, rewindMask, rewindTarget, REWIND_SOURCE_KIND } from '../src/plan.js'
 
 /**
  * Build an ordered session log with contiguous sequence numbers.
@@ -9,66 +9,63 @@ import { buildRewindMessage, extractUserText, openTurn, rewindMask, rewindTarget
  * Mirrors production V4 ordering (verified against stored `session.v4.jsonl.zstd`
  * logs): a turn appends `turn/start` first and admits its prompt's
  * `user/message` *inside* that turn, not before it.
- * @param {Array<[string, unknown]>} entries - Event type and payload pairs.
+ * @param {Array<[string, object, object?]>} entries - Type, payload and optional surface intent.
  * @returns {object[]} Raw session events.
  */
 function log(entries) {
-  return entries.map((entry, index) => ({ type: entry[0], seq: index, data: entry[1] }))
+  const surface = new Set(['system/message', 'developer/message', 'user/message', 'assistant/message', 'tool/result'])
+  const nodes = []
+  return entries.map(([type, data, options], seq) => {
+    const event = { type, seq, data, time: seq, ...(surface.has(type) ? { surfaceOp: 'append' } : {}), ...options }
+    if (event.surfaceOp === 'append') nodes.push(seq)
+    else if (event.surfaceOp?.op === 'replace') {
+      const start = nodes.indexOf(event.surfaceOp.startSeq), end = nodes.indexOf(event.surfaceOp.endSeq)
+      assert.ok(start >= 0 && end >= start, `fixture at ${seq} must replace live surface nodes`)
+      for (const source of nodes.splice(start, end - start + 1, seq)) assert.ok(event.sourceEventSeqs.includes(source))
+    }
+    return event
+  })
 }
 
-/**
- * One complete turn opened by a durable user message.
- * @param {string} input - Text of the input that starts the turn.
- * @param {string} id - Durable id of that message.
- * @param {string} [output] - Assistant answer.
- * @returns {Array<[string, unknown]>} Turn events.
- */
-const turn = (input, id, output = 'answer') => [
-  ['turn/start', {}],
-  ['user/message', { id, role: 'user', content: [{ type: 'text', text: input }] }],
-  ['assistant/message', { message: { role: 'assistant', content: [{ type: 'text', text: output }] } }],
-  ['turn/end', {}],
-]
+const user = (id, text = id, kind = 'user') => ({ id, role: 'user', source: { kind }, content: [{ type: 'text', text }] })
+const start = turn => [['turn/start', { turn }], ['step/start', { turn, step: 1 }]]
+const end = turn => [['step/end', { turn, step: 1 }], ['turn/end', { turn, reason: { kind: 'completed' } }]]
+const replace = (first, last, ...sources) => ({ surfaceOp: { op: 'replace', startSeq: first, endSeq: last }, sourceEventSeqs: sources })
+const answer = turn => ['assistant/message', { turn, step: 1, stream: [], message: {
+  id: `a${turn}`, role: 'assistant', source: { kind: 'model', model: 'stub', provider: 'stub' }, content: [{ type: 'text', text: 'answer' }],
+} }]
+const turn = (n, input, id) => [...start(n), ['user/message', user(id, input)], answer(n), ...end(n)]
 
 test('a middle message is addressed by its durable id', () => {
-  const events = log([...turn('first', 'm1'), ...turn('second', 'm2'), ...turn('third', 'm3')])
-  assert.deepEqual(rewindTarget(events, 'm2'), { kind: 'ok', seq: 5, text: 'second' })
+  const events = log([...turn(1, 'first', 'm1'), ...turn(2, 'second', 'm2'), ...turn(3, 'third', 'm3')])
+  assert.deepEqual(rewindTarget(events, 'm2'), { kind: 'ok', seq: 8, text: 'second' })
 })
 
 test('the newest message keeps its own text, not an earlier one', () => {
-  const events = log([...turn('first', 'm1'), ...turn('second', 'm2')])
-  assert.deepEqual(rewindTarget(events, 'm2'), { kind: 'ok', seq: 5, text: 'second' })
+  const events = log([...turn(1, 'first', 'm1'), ...turn(2, 'second', 'm2')])
+  assert.deepEqual(rewindTarget(events, 'm2'), { kind: 'ok', seq: 8, text: 'second' })
 })
 
 test('the first message is addressable like any other', () => {
-  const events = log(turn('only', 'm1'))
-  assert.deepEqual(rewindTarget(events, 'm1'), { kind: 'ok', seq: 1, text: 'only' })
+  const events = log(turn(1, 'only', 'm1'))
+  assert.deepEqual(rewindTarget(events, 'm1'), { kind: 'ok', seq: 2, text: 'only' })
 })
 
 test('a message added while a turn runs stays addressable', () => {
   const events = log([
-    ...turn('first', 'm1'),
-    ['turn/start', {}],
-    ['user/message', { id: 'm2', role: 'user', content: [{ type: 'text', text: 'second' }] }],
-    ['user/message', { id: 's1', role: 'user', content: [{ type: 'text', text: 'steering' }] }],
-    ['turn/end', {}],
+    ...turn(1, 'first', 'm1'), ...start(2),
+    ['user/message', user('m2', 'second')], ['user/message', user('s1', 'steering')], ...end(2),
   ])
-  assert.deepEqual(rewindTarget(events, 's1'), { kind: 'ok', seq: 6, text: 'steering' })
+  assert.deepEqual(rewindTarget(events, 's1'), { kind: 'ok', seq: 9, text: 'steering' })
 })
 
 test('a replacing message is not a rewind target', () => {
-  const events = log(turn('first', 'm1'))
-  events.push({
-    type: 'user/message',
-    seq: 4,
-    data: { id: 'm9', role: 'user', content: [{ type: 'text', text: 'rewritten' }] },
-    surfaceOp: { op: 'replace', startSeq: 1, endSeq: 1 },
-  })
+  const events = log([...turn(1, 'first', 'm1'), ['user/message', user('m9', 'rewritten'), replace(2, 2, 2)]])
   assert.deepEqual(rewindTarget(events, 'm9'), { kind: 'error', reason: 'unknown-message' })
 })
 
 test('unknown messages and empty logs are reported, not guessed', () => {
-  const events = log(turn('only', 'm1'))
+  const events = log(turn(1, 'only', 'm1'))
   assert.deepEqual(rewindTarget(events, 'nope'), { kind: 'error', reason: 'unknown-message' })
   assert.deepEqual(rewindTarget(events, ''), { kind: 'error', reason: 'unknown-message' })
   assert.deepEqual(rewindTarget(events, undefined), { kind: 'error', reason: 'unknown-message' })
@@ -90,24 +87,50 @@ test('text extraction joins text parts and drops the others', () => {
   assert.equal(extractUserText(undefined), '')
 })
 
-test('the rewind message always carries a non-user source', () => {
-  const message = buildRewindMessage('hello', 1700000000000)
+// Regression: a step's numeric fields alone do not prove the target's turn.
+test('rewind requires a positive step belonging to the open turn', () => {
+  for (const [turn, stepTurn, step] of [[undefined, 2, 1], [2, 3, 1], [0, 0, 1], [1, 1, 0]]) {
+    const events = log([
+      ...(turn === undefined ? [] : [['turn/start', { turn }]]),
+      ['step/start', { turn: stepTurn, step }],
+      ['user/message', { id: 'target', role: 'user' }],
+    ])
+    const seq = events.at(-1).seq
+    assert.deepEqual(planRewind(events, [seq], seq), { kind: 'error', reason: 'missing-step-position' })
+  }
+})
 
-  // DSH reads `source.kind` on every durable user message while deriving pending
-  // input; a message without a source makes the next prompt throw
-  // "Cannot read properties of undefined (reading 'kind')".
-  assert.equal(typeof message.source?.kind, 'string')
-  assert.equal(message.source.kind, REWIND_SOURCE_KIND)
-  assert.notEqual(message.source.kind, 'user')
-  assert.equal(message.role, 'user')
-  assert.deepEqual(message.content, [{ type: 'text', text: 'hello' }])
-  assert.match(message.id, /^rewind-[0-9a-z]+$/)
+test('a mid-turn steering cut is refused rather than masking the earlier prompt and answer', () => {
+  const events = log([
+    ['turn/start', { turn: 1 }], ['step/start', { turn: 1, step: 1 }],
+    ['user/message', { id: 'prompt', source: { kind: 'user' } }],
+    ['assistant/message', { turn: 1, step: 1 }], ['step/end', { turn: 1, step: 1 }],
+    ['step/start', { turn: 1, step: 2 }], ['user/message', { id: 'steer', source: { kind: 'user' } }],
+    ['step/end', { turn: 1, step: 2 }], ['turn/end', { turn: 1 }],
+  ])
+  assert.deepEqual(planRewind(events, [2, 3, 6], 6), { kind: 'error', reason: 'partial-turn' })
+})
+
+test('rewinding the opening prompt retains earlier context cards but not context appended after it', () => {
+  const pos = { turn: 1, step: 1 }
+  const context = (role, id) => ({ ...pos, message: { role, id, content: [{ type: 'text', text: id }] } })
+  const events = log([
+    ['turn/start', { turn: 1 }], ['step/start', pos],
+    ['system/message', context('system', 'sys')], ['developer/message', context('developer', 'before')],
+    ['user/message', { id: 'a', role: 'user' }], ['developer/message', context('developer', 'after')],
+    ['step/end', pos], ['turn/end', { turn: 1 }],
+  ])
+  const marker = planRewind(events, [2, 3, 4, 5], 4)
+  assert.equal(marker.kind, 'ok')
+  const mask = rewindMask([...events, { type: marker.type, seq: 8, data: marker.data, ...marker.options }])
+  assert.deepEqual(mask.turns, [1])
+  assert.deepEqual(mask.retainedRowKeys, ['14:system-message2', '17:developer-messagebefore'])
 })
 
 test('an open turn is reported and a closed one is not', () => {
-  const running = log([['turn/start', { turn: 1 }], ['user/message', { id: 'a' }]])
+  const running = log([...start(1), ['user/message', user('a')]])
   assert.equal(openTurn(running), 1)
-  const closed = log([['turn/start', { turn: 1 }], ['user/message', { id: 'a' }], ['turn/end', { turn: 1 }]])
+  const closed = log(turn(1, 'only', 'a'))
   assert.equal(openTurn(closed), undefined)
   const nested = log([
     ['turn/start', { turn: 1 }],
@@ -117,143 +140,60 @@ test('an open turn is reported and a closed one is not', () => {
   assert.equal(openTurn(nested), 2)
 })
 
-test('rewindMask reports the turns and messages a marker shadowed', () => {
-  const events = [
-    { type: 'turn/start', seq: 0, data: { turn: 1 } },
-    { type: 'user/message', seq: 1, data: { id: 'a', source: { kind: 'user' } } },
-    { type: 'turn/end', seq: 2, data: { turn: 1 } },
-    { type: 'turn/start', seq: 3, data: { turn: 2 } },
-    { type: 'user/message', seq: 4, data: { id: 'b', source: { kind: 'user' } } },
-    { type: 'turn/end', seq: 5, data: { turn: 2 } },
-    {
-      type: 'user/message',
-      seq: 6,
-      surfaceOp: { op: 'replace', startSeq: 3, endSeq: 5 },
-      data: { id: 'rewind-x', source: { kind: REWIND_SOURCE_KIND } },
-    },
-    { type: 'turn/start', seq: 7, data: { turn: 3 } },
-    { type: 'user/message', seq: 8, data: { id: 'c', source: { kind: 'user' } } },
-  ]
+const twoTurns = () => [...turn(1, 'first', 'a'), ...turn(2, 'second', 'b')]
+const legacyCut = () => ['user/message', user('rewind-x', 'second', REWIND_SOURCE_KIND), replace(8, 9, 8, 9)]
 
-  const mask = rewindMask(events)
-  assert.equal(mask.cutSeq, 3)
+test('rewindMask reports the turns and messages a marker shadowed', () => {
+  const mask = rewindMask(log([...twoTurns(), legacyCut()]))
+  assert.equal(mask.cutSeq, 8)
   assert.deepEqual(mask.turns, [2])
-  assert.deepEqual(mask.messageIds, ['b'])
+  assert.deepEqual(mask.messageIds, ['b', 'rewind-x'])
 })
 
 test('rewindMask keeps a message typed after the rewind visible', () => {
-  const events = [
-    { type: 'turn/start', seq: 0, data: { turn: 1 } },
-    { type: 'user/message', seq: 1, data: { id: 'a', source: { kind: 'user' } } },
-    { type: 'turn/end', seq: 2, data: { turn: 1 } },
-    { type: 'turn/start', seq: 3, data: { turn: 2 } },
-    { type: 'user/message', seq: 4, data: { id: 'gone', source: { kind: 'user' } } },
-    { type: 'turn/end', seq: 5, data: { turn: 2 } },
-    {
-      type: 'user/message',
-      seq: 6,
-      surfaceOp: { op: 'replace', startSeq: 3, endSeq: 5 },
-      data: { id: 'rewind-x', source: { kind: REWIND_SOURCE_KIND } },
-    },
-    { type: 'turn/start', seq: 7, data: { turn: 3 } },
-    { type: 'user/message', seq: 8, data: { id: 'fresh', source: { kind: 'user' } } },
-  ]
-
-  const mask = rewindMask(events)
+  const mask = rewindMask(log([...twoTurns(), legacyCut(), ...turn(3, 'fresh', 'fresh')]))
   assert.equal(mask.messageIds.includes('fresh'), false)
   assert.equal(mask.turns.includes(3), false)
 })
 
 test('rewindMask is empty for a log without a marker', () => {
-  const events = [
-    { type: 'turn/start', seq: 0, data: { turn: 1 } },
-    { type: 'user/message', seq: 1, data: { id: 'a', source: { kind: 'user' } } },
-    { type: 'turn/end', seq: 2, data: { turn: 1 } },
-  ]
+  const events = log(turn(1, 'first', 'a'))
 
   assert.deepEqual(rewindMask(events), { cutSeq: -1, turns: [], messageIds: [] })
 })
 
 test('rewindMask ignores a native system replacement', () => {
-  const events = [
-    { type: 'turn/start', seq: 0, data: { turn: 1 } },
-    { type: 'system/message', seq: 1, data: { turn: 1 } },
-    { type: 'user/message', seq: 2, data: { id: 'a', source: { kind: 'user' } } },
-    // DSH replaces its per-step system message between steps, inside the same
-    // turn. There is no user rewind here; masking its turn would hide the whole
-    // answer even though this session was never rewound.
-    {
-      type: 'system/message',
-      seq: 3,
-      surfaceOp: { op: 'replace', startSeq: 1, endSeq: 2 },
-      data: { turn: 1 },
-    },
-  ]
+  const system = step => ({ turn: 1, step, message: {
+    id: `sys-${step}`, role: 'system', source: { kind: 'system-prompt' }, content: [{ type: 'text', text: 'system' }],
+  } })
+  const events = log([...start(1), ['system/message', system(1)], ['user/message', user('a')],
+    ['step/end', { turn: 1, step: 1 }], ['step/start', { turn: 1, step: 2 }],
+    ['system/message', system(2), replace(2, 2, 2)],
+  ])
 
   assert.deepEqual(rewindMask(events), { cutSeq: -1, turns: [], messageIds: [] })
 })
 
 test('rewindMask ignores compaction, tool-result and native user replacements', () => {
-  const events = [
-    { type: 'turn/start', seq: 0, data: { turn: 1 } },
-    { type: 'user/message', seq: 1, data: { id: 'a', source: { kind: 'user' } } },
-    { type: 'assistant/message', seq: 2, data: { turn: 1 } },
-    { type: 'tool/result', seq: 3, data: { turn: 1 } },
-    { type: 'turn/end', seq: 4, data: { turn: 1 } },
-    { type: 'turn/start', seq: 5, data: { turn: 2 } },
-    { type: 'user/message', seq: 6, data: { id: 'b', source: { kind: 'user' } } },
-    { type: 'assistant/message', seq: 7, data: { turn: 2 } },
-    { type: 'turn/end', seq: 8, data: { turn: 2 } },
-    // Compaction replaces the whole prefix and re-sends selected tool results.
-    {
-      type: 'user/message',
-      seq: 9,
-      surfaceOp: { op: 'replace', startSeq: 1, endSeq: 8 },
-      data: { id: 'compact', source: { kind: 'compact-checkpoint' } },
-    },
-    {
-      type: 'tool/result',
-      seq: 10,
-      surfaceOp: { op: 'replace', startSeq: 3, endSeq: 3 },
-      data: { turn: 1 },
-    },
-    // Some native messages are replaced without any source kind at all.
-    {
-      type: 'user/message',
-      seq: 11,
-      surfaceOp: { op: 'replace', startSeq: 6, endSeq: 6 },
-      data: { id: 'native-user' },
-    },
-  ]
+  const pos = { turn: 1, step: 1 }
+  const tool = text => ({ ...pos, message: { id: 'tool-r', role: 'tool', source: { kind: 'tool', callId: 'c' },
+    toolCallId: 'c', content: [{ type: 'text', text }], isError: false } })
+  const events = log([...start(1), ['user/message', user('a')], answer(1),
+    ['tool/call', { ...pos, name: 'read', callId: 'c', arguments: '{}' }],
+    ['tool/result', tool('original'), { sourceEventSeqs: [4] }], ...end(1), ...turn(2, 'second', 'b'),
+    ['tool/result', tool('abridged'), replace(5, 5, 5)],
+    ['user/message', user('native-user'), replace(10, 10, 10)],
+    // Only current surface nodes [2, 3, 14] belong to this prefix.
+    ['user/message', user('compact', 'summary', 'compact-checkpoint'), replace(2, 14, 2, 3, 14)],
+  ])
 
   assert.deepEqual(rewindMask(events), { cutSeq: -1, turns: [], messageIds: [] })
 })
 
 test('rewindMask folds this plugin marker but not a native replacement', () => {
-  const events = [
-    { type: 'turn/start', seq: 0, data: { turn: 1 } },
-    { type: 'user/message', seq: 1, data: { id: 'a', source: { kind: 'user' } } },
-    { type: 'assistant/message', seq: 2, data: { turn: 1 } },
-    {
-      type: 'system/message',
-      seq: 3,
-      surfaceOp: { op: 'replace', startSeq: 1, endSeq: 2 },
-      data: { turn: 1 },
-    },
-    { type: 'turn/end', seq: 4, data: { turn: 1 } },
-    { type: 'turn/start', seq: 5, data: { turn: 2 } },
-    { type: 'user/message', seq: 6, data: { id: 'b', source: { kind: 'user' } } },
-    { type: 'assistant/message', seq: 7, data: { turn: 2 } },
-    { type: 'turn/end', seq: 8, data: { turn: 2 } },
-    {
-      type: 'user/message',
-      seq: 9,
-      surfaceOp: { op: 'replace', startSeq: 5, endSeq: 8 },
-      data: { id: 'rewind-x', source: { kind: REWIND_SOURCE_KIND } },
-    },
-    { type: 'turn/start', seq: 10, data: { turn: 3 } },
-    { type: 'user/message', seq: 11, data: { id: 'fresh', source: { kind: 'user' } } },
-  ]
-
-  assert.deepEqual(rewindMask(events), { cutSeq: 5, turns: [2], messageIds: ['b'] })
+  const events = log([...twoTurns(),
+    ['user/message', user('native', 'summary', 'compact-checkpoint'), replace(2, 3, 2, 3)],
+    legacyCut(), ...turn(3, 'fresh', 'fresh'),
+  ])
+  assert.deepEqual(rewindMask(events), { cutSeq: 8, turns: [2], messageIds: ['b', 'rewind-x'] })
 })

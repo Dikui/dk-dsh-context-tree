@@ -91,12 +91,28 @@ async function handleRewind(ctx, request, key, confirm) {
   if (confirm && (typeof previewToken !== 'string' || !/^[a-f0-9]{64}:[a-f0-9]{64}$/.test(previewToken))) return stale()
   const session = ctx.sessions.get(sessionId)
   if (!session) return json({ ok: false, reason: 'session-not-active' }, 409)
-  const seq = session.seq
-  const isCurrent = () => ctx.sessions.get(sessionId) === session && session.seq === seq
-  let events, target, marker, files = [], token
+  const sameSession = () => ctx.sessions.get(sessionId) === session
+  let seq
+  const isCurrent = () => sameSession() && session.seq === seq
+  let events, snapshot, target, marker, files = [], token
   try {
-    const snapshot = await ctx.sessionQuery.readSession(sessionId)
-    events = snapshot.events
+    // A stopped turn closes by appending its interrupted assistant message and
+    // its step/turn ends. When the query service reads asynchronously, those
+    // appends can land after the preview starts but before its snapshot arrives.
+    // That is the log settling, not a competing preview: re-read until the
+    // snapshot and seq describe the same revision instead of reporting stale.
+    for (let attempt = 0; ; attempt += 1) {
+      snapshot = await ctx.sessionQuery.readSession(sessionId)
+      if (!sameSession()) return stale()
+      events = snapshot.events
+      seq = session.seq
+      if (events.length === seq) break
+      if (attempt >= 2) {
+        return openTurn(events) !== undefined
+          ? json({ ok: false, reason: 'session-busy' }, 409)
+          : stale()
+      }
+    }
     if (!isCurrent() || events.length !== seq) return stale()
     if (openTurn(events) !== undefined) return json({ ok: false, reason: 'session-busy' }, 409)
     target = rewindTarget(events, messageId)

@@ -59,6 +59,62 @@ test('an open turn, or a message already off-surface, cannot be previewed', asyn
   h.session.append('turn/start', { turn: 3 }); assert.equal((await h.preview('A')).reason, 'session-busy')
 })
 
+test('a stop closing its turn while the preview is read is not a stale preview', async () => {
+  // Regression: a stop aborts immediately, but the loop closes the turn later
+  // by appending the interrupted assistant message, step/end and turn/end.
+  // An asynchronous session read can pick those up after the preview starts.
+  // That is the log settling, not a competing revision.
+  const h = harness()
+  h.session.append('turn/start', { turn: 1 })
+  h.session.append('step/start', { turn: 1, step: 1 })
+  h.session.append('user/message', {
+    id: 'A', role: 'user', content: [{ type: 'text', text: 'A' }], source: { kind: 'user' },
+  }, { surfaceOp: 'append' })
+  h.session.append('assistant/message', {
+    turn: 1, step: 1, interrupted: true, message: { role: 'assistant', content: [{ type: 'text', text: 'partial' }] },
+  }, { surfaceOp: 'append' })
+  let reads = 0
+  h.ctx.sessionQuery.readSession = async () => {
+    reads += 1
+    if (reads === 1) {
+      h.session.append('step/end', { turn: 1, step: 1 })
+      h.session.append('turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } })
+    }
+    return { events: h.events.slice(), inheritedEventCount: 0 }
+  }
+  const preview = await h.preview('A')
+  assert.equal(preview.ok, true)
+  assert.equal(preview.text, 'A')
+  assert.equal(reads, 1)
+})
+
+test('a preview retries when the stop cleanup lands after its first snapshot', async () => {
+  const h = harness()
+  h.session.append('turn/start', { turn: 1 })
+  h.session.append('step/start', { turn: 1, step: 1 })
+  h.session.append('user/message', {
+    id: 'A', role: 'user', content: [{ type: 'text', text: 'A' }], source: { kind: 'user' },
+  }, { surfaceOp: 'append' })
+  h.session.append('assistant/message', {
+    turn: 1, step: 1, interrupted: true, message: { role: 'assistant', content: [{ type: 'text', text: 'partial' }] },
+  }, { surfaceOp: 'append' })
+  const close = () => {
+    h.session.append('step/end', { turn: 1, step: 1 })
+    h.session.append('turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } })
+  }
+  let reads = 0
+  h.ctx.sessionQuery.readSession = async () => {
+    const events = h.events.slice()
+    if (reads === 0) queueMicrotask(close)
+    reads += 1
+    return { events, inheritedEventCount: 0 }
+  }
+  const preview = await h.preview('A')
+  assert.equal(preview.ok, true)
+  assert.equal(preview.text, 'A')
+  assert.equal(reads, 2)
+})
+
 test('a cross-origin or unmarked request is rejected before the route accesses the session', async () => {
   const h = harness(); const handler = h.routes.get(TRUNCATE_ROUTE)
   for (const headers of [{}, { 'x-dk-context-tree': '1', origin: 'https://other.example' }]) {

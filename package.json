@@ -1,6 +1,6 @@
 {
   "name": "dk-dsh-context-tree",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "private": true,
   "type": "module",
   "description": "Rewind a conversation in place: drop a message and everything after it from the model context, and put its text back in the composer",
@@ -27,7 +27,7 @@
   ],
   "engines": {
     "node": ">=22.19.0",
-    "dsh": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3"
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
   },
   "scripts": {
     "check": "node --check index.js && node --check client.js && node --check src/plan.js && node --check src/files.js && node --test test/*.test.js",
